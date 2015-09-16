@@ -170,15 +170,6 @@ class TextBuffer
   onDidStopChanging: (callback) ->
     @emitter.on 'did-stop-changing', callback
 
-  # Public: Invoke the given callback the value of {::isModified} changes.
-  #
-  # * `callback` {Function} to be called when {::isModified} changes.
-  #   * `modified` {Boolean} indicating whether the buffer is modified.
-  #
-  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
-  onDidChangeModified: (callback) ->
-    @emitter.on 'did-change-modified', callback
-
   # Public: Invoke the given callback when all marker `::onDidChange`
   # observers have been notified following a change to the buffer.
   #
@@ -553,9 +544,6 @@ class TextBuffer
     @markerStore?.splice(oldRange.start, oldRange.getExtent(), newRange.getExtent())
     @history?.pushChange(change) unless skipUndo
 
-    @conflict = false if @conflict and !@isModified()
-    @scheduleModifiedEvents()
-
     @changeCount++
     @emitter.emit 'did-change', changeEvent
     @emit 'changed', changeEvent if Grim.includeDeprecatedAPIs
@@ -896,15 +884,12 @@ class TextBuffer
   #
   # Returns a {Number} representing the number of replacements made.
   replace: (regex, replacementText) ->
-    doSave = !@isModified()
     replacements = 0
 
     @transact =>
       @scan regex, ({matchText, replace}) ->
         replace(matchText.replace(regex, replacementText))
         replacements++
-
-    @save() if doSave
 
     replacements
 
@@ -1084,25 +1069,6 @@ class TextBuffer
   # Returns a {Boolean}.
   hasMultipleEditors: -> @refcount > 1
 
-  cancelStoppedChangingTimeout: ->
-    clearTimeout(@stoppedChangingTimeout) if @stoppedChangingTimeout
-
-  scheduleModifiedEvents: ->
-    @cancelStoppedChangingTimeout()
-    stoppedChangingCallback = =>
-      @stoppedChangingTimeout = null
-      modifiedStatus = @isModified()
-      @emitter.emit 'did-stop-changing'
-      @emit 'contents-modified', modifiedStatus if Grim.includeDeprecatedAPIs
-      @emitModifiedStatusChanged(modifiedStatus)
-    @stoppedChangingTimeout = setTimeout(stoppedChangingCallback, @stoppedChangingDelay)
-
-  emitModifiedStatusChanged: (modifiedStatus) ->
-    return if modifiedStatus is @previousModifiedStatus
-    @previousModifiedStatus = modifiedStatus
-    @emitter.emit 'did-change-modified', modifiedStatus
-    @emit 'modified-status-changed', modifiedStatus if Grim.includeDeprecatedAPIs
-
   logLines: (start=0, end=@getLastRow())->
     for row in [start..end]
       line = @lineForRow(row)
@@ -1166,10 +1132,6 @@ if Grim.includeDeprecatedAPIs
     switch eventName
       when 'changed'
         Grim.deprecate("Use TextBuffer::onDidChange instead")
-      when 'contents-modified'
-        Grim.deprecate("Use TextBuffer::onDidStopChanging instead. If you need the modified status, call TextBuffer::isModified yourself in your callback.")
-      when 'modified-status-changed'
-        Grim.deprecate("Use TextBuffer::onDidChangeModified instead")
       when 'markers-updated'
         Grim.deprecate("Use TextBuffer::onDidUpdateMarkers instead")
       when 'marker-created'
