@@ -39,10 +39,8 @@
     "atom-diff": "^2",
     "emissary": "^1.0.0",
     "event-kit": "^1.0.2",
-    "fs-plus": "^2.0.0",
     "grim": "^1.2.1",
     "interval-skip-list": "^2.0.1",
-    "pathwatcher": "^5.0.1",
     "serializable": "^1.0.0",
     "span-skip-list": "~0.2.0",
     "underscore-plus": "^1.0.0"
