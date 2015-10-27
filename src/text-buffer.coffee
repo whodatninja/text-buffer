@@ -1040,7 +1040,6 @@ class TextBuffer
 
   destroy: ->
     unless @destroyed
-      @cancelStoppedChangingTimeout()
       @unsubscribe() if Grim.includeDeprecatedAPIs
       @destroyed = true
       @emitter.emit 'did-destroy'
