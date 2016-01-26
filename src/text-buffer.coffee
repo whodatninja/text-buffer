@@ -1,14 +1,14 @@
-Grim = require 'grim'
 Serializable = require 'serializable'
 {Emitter, CompositeDisposable} = require 'event-kit'
 SpanSkipList = require 'span-skip-list'
 diff = require 'atom-diff'
 _ = require 'underscore-plus'
+crypto = require 'crypto'
 
 Point = require './point'
 Range = require './range'
 History = require './history'
-MarkerStore = require './marker-store'
+MarkerLayer = require './marker-layer'
 Patch = require './patch'
 MatchIterator = require './match-iterator'
 {spliceArray, newlineRegex} = require './helpers'
@@ -56,7 +56,7 @@ class TransactionAbortedError extends Error
 # annotate logical regions in the text.
 module.exports =
 class TextBuffer
-  @version: 2
+  @version: 5
   @Point: Point
   @Range: Range
   @Patch: Patch
@@ -73,6 +73,7 @@ class TextBuffer
   backwardsScanChunkSize: 8000
   defaultMaxUndoEntries: 10000
   changeCount: 0
+  nextMarkerLayerId: 0
 
   ###
   Section: Construction
@@ -86,13 +87,19 @@ class TextBuffer
     text = params if typeof params is 'string'
 
     @emitter = new Emitter
+    @id = params?.id ? crypto.randomBytes(16).toString('hex')
     @lines = ['']
     @lineEndings = ['']
     @offsetIndex = new SpanSkipList('rows', 'characters')
     @setTextInRange([[0, 0], [0, 0]], text ? params?.text ? '', normalizeLineEndings: false)
     maxUndoEntries = params?.maxUndoEntries ? @defaultMaxUndoEntries
     @history = params?.history ? new History(this, maxUndoEntries)
-    @markerStore = params?.markerStore ? new MarkerStore(this)
+    @nextMarkerLayerId = params?.nextMarkerLayerId ? 0
+    @defaultMarkerLayer = params?.defaultMarkerLayer ? new MarkerLayer(this, String(@nextMarkerLayerId++))
+    @markerLayers = params?.markerLayers ? {}
+    @markerLayers[@defaultMarkerLayer.id] = @defaultMarkerLayer
+    @nextMarkerId = params?.nextMarkerId ? 1
+
     @setEncoding(params?.encoding)
     @setPreferredLineEnding(params?.preferredLineEnding)
 
@@ -100,19 +107,36 @@ class TextBuffer
     @transactCallDepth = 0
 
 
+  # Returns a {String} representing a unique identifier for this {TextBuffer}.
+  getId: ->
+    @id
+
   # Called by {Serializable} mixin during deserialization.
   deserializeParams: (params) ->
-    params.markerStore = MarkerStore.deserialize(this, params.markerStore)
+    markerLayers = {}
+    for layerId, layerState of params.markerLayers
+      markerLayers[layerId] = MarkerLayer.deserialize(this, layerState)
+    params.markerLayers = markerLayers
+    params.defaultMarkerLayer = params.markerLayers[params.defaultMarkerLayerId]
     params.history = History.deserialize(this, params.history)
+    params.load = true if params.filePath
     params
 
   # Called by {Serializable} mixin during serialization.
   serializeParams: ->
+    markerLayers = {}
+    for id, layer of @markerLayers
+      markerLayers[id] = layer.serialize()
+
+    id: @getId()
     text: @getText()
-    markerStore: @markerStore.serialize()
+    defaultMarkerLayerId: @defaultMarkerLayer.id
+    markerLayers: markerLayers
+    nextMarkerLayerId: @nextMarkerLayerId
     history: @history.serialize()
     encoding: @getEncoding()
     preferredLineEnding: @preferredLineEnding
+    nextMarkerId: @nextMarkerId
 
   ###
   Section: Event Subscription
@@ -169,6 +193,24 @@ class TextBuffer
   # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
   onDidStopChanging: (callback) ->
     @emitter.on 'did-stop-changing', callback
+
+  # Public: Invoke the given callback when the in-memory contents of the
+  # buffer become in conflict with the contents of the file on disk.
+  #
+  # * `callback` {Function} to be called when the buffer enters conflict.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidConflict: (callback) ->
+    @emitter.on 'did-conflict', callback
+
+  # Public: Invoke the given callback if the value of {::isModified} changes.
+  #
+  # * `callback` {Function} to be called when {::isModified} changes.
+  #   * `modified` {Boolean} indicating whether the buffer is modified.
+  #
+  # Returns a {Disposable} on which `.dispose()` can be called to unsubscribe.
+  onDidChangeModified: (callback) ->
+    @emitter.on 'did-change-modified', callback
 
   # Public: Invoke the given callback when all marker `::onDidChange`
   # observers have been notified following a change to the buffer.
@@ -441,10 +483,7 @@ class TextBuffer
     if @transactCallDepth is 0
       return @transact => @setTextInRange(range, newText, options)
 
-    if Grim.includeDeprecatedAPIs and typeof options is 'boolean'
-      normalizeLineEndings = options
-      Grim.deprecate("The normalizeLineEndings argument is now an options hash. Use {normalizeLineEndings: #{options}} instead")
-    else if options?
+    if options?
       {normalizeLineEndings, undo} = options
     normalizeLineEndings ?= true
 
@@ -488,8 +527,6 @@ class TextBuffer
     startRow = oldRange.start.row
     endRow = oldRange.end.row
     rowCount = endRow - startRow + 1
-    oldExtent = oldRange.getExtent()
-    newExtent = newRange.getExtent()
 
     # Determine how to normalize the line endings of inserted text if enabled
     if normalizeLineEndings
@@ -541,12 +578,16 @@ class TextBuffer
       {rows: 1, characters: line.length + lineEndings[index].length}
     @offsetIndex.spliceArray('rows', startRow, rowCount, offsets)
 
-    @markerStore?.splice(oldRange.start, oldRange.getExtent(), newRange.getExtent())
+    if @markerLayers?
+      oldExtent = oldRange.getExtent()
+      newExtent = newRange.getExtent()
+      for id, markerLayer of @markerLayers
+        markerLayer.splice(oldRange.start, oldExtent, newExtent)
+
     @history?.pushChange(change) unless skipUndo
 
     @changeCount++
     @emitter.emit 'did-change', changeEvent
-    @emit 'changed', changeEvent if Grim.includeDeprecatedAPIs
 
   # Public: Delete the text in the given range.
   #
@@ -603,18 +644,51 @@ class TextBuffer
   Section: Markers
   ###
 
-  # Public: Create a marker with the given range. This marker will maintain
-  # its logical location as the buffer is changed, so if you mark a particular
-  # word, the marker will remain over that word even if the word's location in
-  # the buffer changes.
+  # Public: *Experimental:* Create a layer to contain a set of related markers.
+  #
+  # * `options` An object contaning the following keys:
+  #   * `maintainHistory` A {Boolean} indicating whether or not the state of
+  #     this layer should be restored on undo/redo operations. Defaults to
+  #     `false`.
+  #
+  # This API is experimental and subject to change on any release.
+  #
+  # Returns a {MarkerLayer}.
+  addMarkerLayer: (options) ->
+    layer = new MarkerLayer(this, String(@nextMarkerLayerId++), options)
+    @markerLayers[layer.id] = layer
+    layer
+
+  # Public: *Experimental:* Get a {MarkerLayer} by id.
+  #
+  # * `id` The id of the marker layer to retrieve.
+  #
+  # This API is experimental and subject to change on any release.
+  #
+  # Returns a {MarkerLayer} or `undefined` if no layer exists with the given
+  # id.
+  getMarkerLayer: (id) ->
+    @markerLayers[id]
+
+  # Public: *Experimental:* Get the default {MarkerLayer}.
+  #
+  # All marker APIs not tied to an explicit layer interact with this default
+  # layer.
+  #
+  # This API is experimental and subject to change on any release.
+  #
+  # Returns a {MarkerLayer}.
+  getDefaultMarkerLayer: ->
+    @defaultMarkerLayer
+
+  # Public: Create a marker with the given range in the default marker layer.
+  # This marker will maintain its logical location as the buffer is changed, so
+  # if you mark a particular word, the marker will remain over that word even if
+  # the word's location in the buffer changes.
   #
   # * `range` A {Range} or range-compatible {Array}
   # * `properties` A hash of key-value pairs to associate with the marker. There
   #   are also reserved property names that have marker-specific meaning.
-  #   * `maintainHistory` (optional) {Boolean} Whether to store this marker's
-  #     range before and after each change in the undo history. This allows the
-  #     marker's position to be restored more accurately for certain undo/redo
-  #     operations, but uses more time and memory. (default: false)
   #   * `reversed` (optional) {Boolean} Creates the marker in a reversed
   #     orientation. (default: false)
   #   * `persistent` (optional) {Boolean} Whether to include this marker when
@@ -635,29 +709,31 @@ class TextBuffer
   #       start or start at the marker's end. This is the most fragile strategy.
   #
   # Returns a {Marker}.
-  markRange: (range, properties) -> @markerStore.markRange(@clipRange(range), properties)
+  markRange: (range, properties) -> @defaultMarkerLayer.markRange(range, properties)
 
-  # Public: Create a marker at the given position with no tail.
+  # Public: Create a marker at the given position with no tail in the default
+  # marker layer.
   #
   # * `position` {Point} or point-compatible {Array}
   # * `properties` This is the same as the `properties` parameter in {::markRange}
   #
   # Returns a {Marker}.
-  markPosition: (position, properties) -> @markerStore.markPosition(@clipPosition(position), properties)
+  markPosition: (position, properties) -> @defaultMarkerLayer.markPosition(position, properties)
 
-  # Public: Get all existing markers on the buffer.
+  # Public: Get all existing markers on the default marker layer.
   #
   # Returns an {Array} of {Marker}s.
-  getMarkers: -> @markerStore.getMarkers()
+  getMarkers: -> @defaultMarkerLayer.getMarkers()
 
-  # Public: Get an existing marker by its id.
+  # Public: Get an existing marker by its id from the default marker layer.
   #
   # * `id` {Number} id of the marker to retrieve
   #
   # Returns a {Marker}.
-  getMarker: (id) -> @markerStore.getMarker(id)
+  getMarker: (id) -> @defaultMarkerLayer.getMarker(id)
 
-  # Public: Find markers conforming to the given parameters.
+  # Public: Find markers conforming to the given parameters in the default
+  # marker layer.
   #
   # Markers are sorted based on their position in the buffer. If two markers
   # start at the same position, the larger marker comes first.
@@ -675,12 +751,12 @@ class TextBuffer
   #   * `intersectsRow` Only include markers that intersect the given row {Number}.
   #
   # Returns an {Array} of {Marker}s.
-  findMarkers: (params) -> @markerStore.findMarkers(params)
+  findMarkers: (params) -> @defaultMarkerLayer.findMarkers(params)
 
-  # Public: Get the number of markers in the buffer.
+  # Public: Get the number of markers in the default marker layer.
   #
   # Returns a {Number}.
-  getMarkerCount: -> @markerStore.getMarkerCount()
+  getMarkerCount: -> @defaultMarkerLayer.getMarkerCount()
 
   destroyMarker: (id) ->
     @getMarker(id)?.destroy()
@@ -693,7 +769,8 @@ class TextBuffer
   undo: ->
     if pop = @history.popUndoStack()
       @applyChange(change, true) for change in pop.changes
-      @markerStore.restoreFromSnapshot(pop.snapshot)
+      @restoreFromMarkerSnapshot(pop.snapshot)
+      @emitMarkerChangeEvents(pop.snapshot)
       true
     else
       false
@@ -702,7 +779,8 @@ class TextBuffer
   redo: ->
     if pop = @history.popRedoStack()
       @applyChange(change, true) for change in pop.changes
-      @markerStore.restoreFromSnapshot(pop.snapshot)
+      @restoreFromMarkerSnapshot(pop.snapshot)
+      @emitMarkerChangeEvents(pop.snapshot)
       true
     else
       false
@@ -725,7 +803,7 @@ class TextBuffer
       fn = groupingInterval
       groupingInterval = 0
 
-    checkpointBefore = @history.createCheckpoint(@markerStore.createSnapshot(false), true)
+    checkpointBefore = @history.createCheckpoint(@createMarkerSnapshot(), true)
 
     try
       @transactCallDepth++
@@ -737,8 +815,10 @@ class TextBuffer
     finally
       @transactCallDepth--
 
-    @history.groupChangesSinceCheckpoint(checkpointBefore, @markerStore.createSnapshot(true), true)
+    endMarkerSnapshot = @createMarkerSnapshot()
+    @history.groupChangesSinceCheckpoint(checkpointBefore, endMarkerSnapshot, true)
     @history.applyGroupingInterval(groupingInterval)
+    @emitMarkerChangeEvents(endMarkerSnapshot)
 
     result
 
@@ -753,7 +833,7 @@ class TextBuffer
   #
   # Returns a checkpoint value.
   createCheckpoint: ->
-    @history.createCheckpoint(@markerStore.createSnapshot(), false)
+    @history.createCheckpoint(@createMarkerSnapshot(), false)
 
   # Public: Revert the buffer to the state it was in when the given
   # checkpoint was created.
@@ -767,9 +847,8 @@ class TextBuffer
   revertToCheckpoint: (checkpoint) ->
     if truncated = @history.truncateUndoStack(checkpoint)
       @applyChange(change, true) for change in truncated.changes
-      @markerStore.restoreFromSnapshot(truncated.snapshot)
+      @restoreFromMarkerSnapshot(truncated.snapshot)
       @emitter.emit 'did-update-markers'
-      @emit 'markers-updated' if Grim.includeDeprecatedAPIs
       true
     else
       false
@@ -782,7 +861,7 @@ class TextBuffer
   #
   # Returns a {Boolean} indicating whether the operation succeeded.
   groupChangesSinceCheckpoint: (checkpoint) ->
-    @history.groupChangesSinceCheckpoint(checkpoint, @markerStore.createSnapshot(false), false)
+    @history.groupChangesSinceCheckpoint(checkpoint, @createMarkerSnapshot(), false)
 
   ###
   Section: Search And Replace
@@ -944,11 +1023,6 @@ class TextBuffer
   #
   # Returns a {Range}.
   rangeForRow: (row, includeNewline) ->
-    # Handle deprecated options hash
-    if Grim.includeDeprecatedAPIs and typeof includeNewline is 'object'
-      Grim.deprecate("The second param is no longer an object, it's a boolean argument named `includeNewline`.")
-      {includeNewline} = includeNewline
-
     row = Math.max(row, 0)
     row = Math.min(row, @getLastRow())
 
@@ -1043,7 +1117,6 @@ class TextBuffer
       @unsubscribe() if Grim.includeDeprecatedAPIs
       @destroyed = true
       @emitter.emit 'did-destroy'
-      @emit 'destroyed' if Grim.includeDeprecatedAPIs
 
   isAlive: -> not @destroyed
 
@@ -1060,6 +1133,20 @@ class TextBuffer
     @destroy() unless @isRetained()
     this
 
+  createMarkerSnapshot: ->
+    snapshot = {}
+    for markerLayerId, markerLayer of @markerLayers
+      if markerLayer.maintainHistory
+        snapshot[markerLayerId] = markerLayer.createSnapshot()
+    snapshot
+
+  restoreFromMarkerSnapshot: (snapshot) ->
+    for markerLayerId, layerSnapshot of snapshot
+      @markerLayers[markerLayerId]?.restoreFromSnapshot(layerSnapshot)
+
+  emitMarkerChangeEvents: (snapshot) ->
+    for markerLayerId, markerLayer of @markerLayers
+      markerLayer.emitChangeEvents(snapshot?[markerLayerId])
 
   # Identifies if the buffer belongs to multiple editors.
   #
@@ -1103,62 +1190,24 @@ class TextBuffer
     }
 
   serializeSnapshot: (snapshot) ->
-    MarkerStore.serializeSnapshot(snapshot)
+    MarkerLayer.serializeSnapshot(snapshot)
 
   deserializeSnapshot: (snapshot) ->
-    MarkerStore.deserializeSnapshot(snapshot)
+    MarkerLayer.deserializeSnapshot(snapshot)
 
   ###
-  Section: Private MarkerStore Delegate Methods
+  Section: Private MarkerLayer Delegate Methods
   ###
 
-  markerCreated: (marker) ->
-    @emitter.emit 'did-create-marker', marker
-    @emit 'marker-created', marker if Grim.includeDeprecatedAPIs
+  markerLayerDestroyed: (markerLayer) ->
+    delete @markerLayers[markerLayer.id]
 
-  markersUpdated: ->
-    @emitter.emit 'did-update-markers'
-    @emit 'markers-updated' if Grim.includeDeprecatedAPIs
+  markerCreated: (layer, marker) ->
+    if layer is @defaultMarkerLayer
+      @emitter.emit 'did-create-marker', marker
 
-if Grim.includeDeprecatedAPIs
-  EmitterMixin = require('emissary').Emitter
-  EmitterMixin.includeInto(TextBuffer)
+  markersUpdated: (layer) ->
+    if layer is @defaultMarkerLayer
+      @emitter.emit 'did-update-markers'
 
-  {Subscriber} = require 'emissary'
-  Subscriber.includeInto(TextBuffer)
-
-  TextBuffer::on = (eventName) ->
-    switch eventName
-      when 'changed'
-        Grim.deprecate("Use TextBuffer::onDidChange instead")
-      when 'markers-updated'
-        Grim.deprecate("Use TextBuffer::onDidUpdateMarkers instead")
-      when 'marker-created'
-        Grim.deprecate("Use TextBuffer::onDidCreateMarker instead")
-      when 'destroyed'
-        Grim.deprecate("Use TextBuffer::onDidDestroy instead")
-      else
-        Grim.deprecate("TextBuffer::on is deprecated. Use event subscription methods instead.")
-
-    EmitterMixin::on.apply(this, arguments)
-
-  TextBuffer::change = (oldRange, newText, options={}) ->
-    Grim.deprecate("Use TextBuffer::setTextInRange instead.")
-    @setTextInRange(oldRange, newText, options.normalizeLineEndings)
-
-  TextBuffer::usesSoftTabs = ->
-    Grim.deprecate("Use TextEditor::usesSoftTabs instead. TextBuffer doesn't have enough context to determine this.")
-    for row in [0..@getLastRow()]
-      if match = @lineForRow(row).match(/^\s/)
-        return match[0][0] != '\t'
-    undefined
-
-  TextBuffer::getEofPosition = ->
-    Grim.deprecate("Use TextBuffer::getEndPosition instead.")
-    @getEndPosition()
-
-  TextBuffer::beginTransaction = (groupingInterval) ->
-    Grim.deprecate("Open-ended transactions are deprecated. Use checkpoints instead.")
-
-  TextBuffer::commitTransaction = ->
-    Grim.deprecate("Open-ended transactions are deprecated. Use checkpoints instead.")
+  getNextMarkerId: -> @nextMarkerId++

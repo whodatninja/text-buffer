@@ -1,11 +1,14 @@
 {
   "name": "text-buffer",
-  "version": "7.0.2",
+  "version": "8.1.4",
   "description": "A container for large mutable strings with annotated regions",
   "main": "./lib/text-buffer",
   "scripts": {
     "prepublish": "grunt clean lint coffee shell:update-atomdoc atomdoc",
-    "test": "grunt test"
+    "compile": "coffee --no-header --output lib --compile src",
+    "lint": "coffeelint -r src spec",
+    "test": "jasmine-focused --coffee --captureExceptions --forceexit spec",
+    "ci": "npm run compile && npm run lint && npm run test"
   },
   "repository": {
     "type": "git",
@@ -14,15 +17,11 @@
   "bugs": {
     "url": "https://github.com/atom/text-buffer/issues"
   },
-  "licenses": [
-    {
-      "type": "MIT",
-      "url": "http://github.com/atom/text-buffer/raw/master/LICENSE.md"
-    }
-  ],
+  "license": "MIT",
   "devDependencies": {
     "coffee-cache": "~0.2.0",
     "coffee-script": "~1.7.0",
+    "coffeelint": "^1.14.1",
     "grunt": "~0.4.1",
     "grunt-atomdoc": "^1.0",
     "grunt-cli": "~0.1.8",
@@ -32,17 +31,27 @@
     "jasmine-focused": "1.x",
     "random-seed": "^0.2.0",
     "rimraf": "~2.2.2",
-    "temp": "~0.6.0"
+    "temp": "^0.8.3"
   },
   "dependencies": {
     "delegato": "^1.0.0",
     "atom-diff": "^2",
     "emissary": "^1.0.0",
     "event-kit": "^1.0.2",
-    "grim": "^1.2.1",
-    "interval-skip-list": "^2.0.1",
-    "serializable": "^1.0.0",
+    "marker-index": "^3.1.0",
+    "serializable": "^1.0.3",
     "span-skip-list": "~0.2.0",
     "underscore-plus": "^1.0.0"
+  },
+  "coffeelintConfig": {
+    "no_empty_param_list": {
+      "level": "error"
+    },
+    "max_line_length": {
+      "level": "ignore"
+    },
+    "indentation": {
+      "level": "ignore"
+    }
   }
 }

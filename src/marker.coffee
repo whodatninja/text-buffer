@@ -1,11 +1,10 @@
 {extend, isEqual, omit, pick, size} = require 'underscore-plus'
 {Emitter} = require 'event-kit'
-Grim = require 'grim'
 Delegator = require 'delegato'
 Point = require './point'
 Range = require './range'
 
-OptionKeys = new Set(['reversed', 'tailed', 'invalidate', 'persistent', 'maintainHistory'])
+OptionKeys = new Set(['reversed', 'tailed', 'invalidate', 'persistent'])
 
 # Private: Represents a buffer annotation that remains logically stationary
 # even as the buffer changes. This is used to represent cursors, folds, snippet
@@ -32,7 +31,6 @@ class Marker
   @extractParams: (inputParams) ->
     outputParams = {}
     if inputParams?
-      @handleDeprecatedParams(inputParams) if Grim.includeDeprecatedAPIs
       for key in Object.keys(inputParams)
         if OptionKeys.has(key)
           outputParams[key] = inputParams[key]
@@ -43,20 +41,19 @@ class Marker
 
   @delegatesMethods 'containsPoint', 'containsRange', 'intersectsRow', toMethod: 'getRange'
 
-  constructor: (@id, @store, range, params) ->
-    {@tailed, @reversed, @valid, @invalidate, @persistent, @properties, @maintainHistory} = params
+  constructor: (@id, @layer, range, params) ->
+    {@tailed, @reversed, @valid, @invalidate, @persistent, @properties} = params
     @emitter = new Emitter
     @tailed ?= true
     @reversed ?= false
     @valid ?= true
     @invalidate ?= 'overlap'
     @persistent ?= true
-    @maintainHistory ?= false
     @properties ?= {}
     @hasChangeObservers = false
     @rangeWhenDestroyed = null
     Object.freeze(@properties)
-    @store.setMarkerHasTail(@id, @tailed)
+    @layer.setMarkerHasTail(@id, @tailed)
 
   ###
   Section: Event Subscription
@@ -92,11 +89,12 @@ class Marker
     unless @hasChangeObservers
       @previousEventState = @getSnapshot(@getRange())
       @hasChangeObservers = true
+      @layer.markersIdsWithChangeSubscriptions.add(@id)
     @emitter.on 'did-change', callback
 
   # Public: Returns the current {Range} of the marker. The range is immutable.
   getRange: ->
-    @rangeWhenDestroyed ? @store.getMarkerRange(@id)
+    @rangeWhenDestroyed ? @layer.getMarkerRange(@id)
 
   # Public: Sets the range of the marker.
   #
@@ -182,12 +180,12 @@ class Marker
   # Public: Returns a {Point} representing the start position of the marker,
   # which could be the head or tail position, depending on its orientation.
   getStartPosition: ->
-    @rangeWhenDestroyed?.start ? @store.getMarkerStartPosition(@id)
+    @rangeWhenDestroyed?.start ? @layer.getMarkerStartPosition(@id)
 
   # Public: Returns a {Point} representing the end position of the marker,
   # which could be the head or tail position, depending on its orientation.
   getEndPosition: ->
-    @rangeWhenDestroyed?.end ? @store.getMarkerEndPosition(@id)
+    @rangeWhenDestroyed?.end ? @layer.getMarkerEndPosition(@id)
 
   # Public: Removes the marker's tail. After calling the marker's head position
   # will be reported as its current tail position until the tail is planted
@@ -197,6 +195,7 @@ class Marker
   clearTail: (properties) ->
     params = @extractParams(properties)
     params.tailed = false
+    params.reversed = false
     headPosition = @getHeadPosition()
     params.range = new Range(headPosition, headPosition)
     @update(@getRange(), params)
@@ -241,7 +240,6 @@ class Marker
     @invalidate is other.invalidate and
       @tailed is other.tailed and
       @persistent is other.persistent and
-      @maintainHistory is other.maintainHistory and
       @reversed is other.reversed and
       isEqual(@properties, other.properties) and
       @getRange().isEqual(other.getRange())
@@ -273,20 +271,19 @@ class Marker
   copy: (options={}) ->
     snapshot = @getSnapshot(null)
     options = Marker.extractParams(options)
-    @store.createMarker(@getRange(), extend(
+    @layer.createMarker(@getRange(), extend(
       {}
       snapshot,
       options,
       properties: extend({}, snapshot.properties, options.properties)
     ))
 
-  # Public: Destroys the marker, causing it to emit the 'destroyed' event. Once
-  # destroyed, a marker cannot be restored by undo/redo operations.
+  # Public: Destroys the marker, causing it to emit the 'destroyed' event.
   destroy: ->
+    return if @rangeWhenDestroyed?
     @rangeWhenDestroyed = @getRange()
-    @store.destroyMarker(@id)
+    @layer.destroyMarker(@id)
     @emitter.emit 'did-destroy'
-    @emit 'destroyed' if Grim.includeDeprecatedAPIs
 
   extractParams: (params) ->
     params = @constructor.extractParams(params)
@@ -297,7 +294,10 @@ class Marker
   #
   # * `other` {Marker}
   compare: (other) ->
-    @getRange().compare(other.getRange())
+    if @rangeWhenDestroyed? or other.rangeWhenDestroyed?
+      @getRange().compare(other.getRange())
+    else
+      @layer.compareMarkers(@id, other.id)
 
   # Returns whether this marker matches the given parameters. The parameters
   # are the same as {MarkerManager::findMarkers}.
@@ -324,7 +324,7 @@ class Marker
         @getEndPosition().row is value
       when 'intersectsRow'
         @intersectsRow(value)
-      when 'invalidate', 'reversed', 'tailed', 'persistent', 'maintainHistory'
+      when 'invalidate', 'reversed', 'tailed', 'persistent'
         isEqual(@[key], value)
       else
         isEqual(@properties[key], value)
@@ -335,7 +335,7 @@ class Marker
     updated = propertiesChanged = false
 
     if range? and not range.isEqual(oldRange)
-      @store.setMarkerRange(@id, range)
+      @layer.setMarkerRange(@id, range)
       updated = true
 
     if reversed? and reversed isnt @reversed
@@ -344,7 +344,7 @@ class Marker
 
     if tailed? and tailed isnt @tailed
       @tailed = tailed
-      @store.setMarkerHasTail(@id, @tailed)
+      @layer.setMarkerHasTail(@id, @tailed)
       updated = true
 
     if valid? and valid isnt @valid
@@ -357,11 +357,11 @@ class Marker
       updated = true
 
     @emitChangeEvent(range ? oldRange, textChanged, propertiesChanged)
-    @store.markerUpdated() if updated and not textChanged
+    @layer.markerUpdated() if updated and not textChanged
     updated
 
   getSnapshot: (range) ->
-    Object.freeze({range, @properties, @reversed, @tailed, @valid, @invalidate, @maintainHistory})
+    Object.freeze({range, @properties, @reversed, @tailed, @valid, @invalidate})
 
   toString: ->
     "[Marker #{@id}, #{@getRange()}]"
@@ -406,51 +406,3 @@ class Marker
       textChanged
     })
     true
-
-if Grim.includeDeprecatedAPIs
-  EmitterMixin = require('emissary').Emitter
-  EmitterMixin.includeInto(Marker)
-
-  Marker::on = (eventName) ->
-    switch eventName
-      when 'changed'
-        Grim.deprecate("Use Marker::onDidChange instead")
-      when 'destroyed'
-        Grim.deprecate("Use Marker::onDidDestroy instead")
-      else
-        Grim.deprecate("Marker::on is deprecated. Use event subscription methods instead.")
-
-    EmitterMixin::on.apply(this, arguments)
-
-  Marker::matchesAttributes = (args...) ->
-    Grim.deprecate("Use Marker::matchesParams instead.")
-    @matchesParams(args...)
-
-  Marker::getAttributes = ->
-    Grim.deprecate("Use Marker::getProperties instead.")
-    @getProperties()
-
-  Marker::setAttributes = (args...) ->
-    Grim.deprecate("Use Marker::setProperties instead.")
-    @setProperties(args...)
-
-  Marker.handleDeprecatedParams = (params) ->
-    if params.isReversed?
-      Grim.deprecate("The option `isReversed` is deprecated, use `reversed` instead")
-      params.reversed = params.isReversed
-      delete params.isReversed
-
-    if params.hasTail?
-      Grim.deprecate("The option `hasTail` is deprecated, use `tailed` instead")
-      params.tailed = params.hasTail
-      delete params.hasTail
-
-    if params.persist?
-      Grim.deprecate("The option `persist` is deprecated, use `persistent` instead")
-      params.persistent = params.persist
-      delete params.persist
-
-    if params.invalidation
-      Grim.deprecate("The option `invalidation` is deprecated, use `invalidate` instead")
-      params.invalidate = params.invalidation
-      delete params.invalidation
